@@ -4,6 +4,7 @@ from sqlalchemy import engine_from_config
 from sqlalchemy import pool
 from app.models.registration import User
 from app.models.tokens import RefreshToken
+from app.models.learnings import Subject, SubjectTopic
 from app.database.db import Base
 
 from alembic import context

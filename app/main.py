@@ -8,7 +8,7 @@ import uvicorn
 
 from app.config.config import settings
 from app.database.db import engine
-from app.api.routers.v1 import login, registrations
+from app.api.routers.v1 import login, registrations, learnings
 from app.models import registration, tokens 
 
 
@@ -67,6 +67,7 @@ app.add_middleware(
 
 app.include_router(registrations.router, prefix="/api/v1/registration", tags=["Registration"])
 app.include_router(login.router, prefix="/api/v1/auth", tags=["Login"])
+app.include_router(learnings.router, prefix="/api/v1/sessions", tags=["Learnings"])
 
 # -------------------------------------------------------
 # Health Check
