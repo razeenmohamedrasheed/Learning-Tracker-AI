@@ -1,12 +1,9 @@
-# app/crud/subject.py
-
 import uuid
-from decimal import Decimal
+from decimal import Decimal, ROUND_DOWN
 from datetime import datetime, timezone
 
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
-from sqlalchemy import func
 
 from app.models.learnings import Subject, SubjectTopic
 
@@ -22,8 +19,8 @@ async def create_subject(
 ) -> Subject:
     """Create a new subject."""
     subject = Subject(
-        id         = str(uuid.uuid4()),
-        user_id    = user_id,
+        id      = str(uuid.uuid4()),
+        user_id = user_id,
         **data,
     )
     db.add(subject)
@@ -51,7 +48,7 @@ async def get_all_subjects(
     db: AsyncSession,
     user_id: str,
 ) -> list[Subject]:
-    """Get all subjects for a user."""
+    """Get all subjects for a user — topics loaded via selectin."""
     result = await db.execute(
         select(Subject)
         .where(Subject.user_id == user_id)
@@ -65,10 +62,23 @@ async def update_subject(
     subject: Subject,
     data: dict,
 ) -> Subject:
-    """Update subject fields."""
+    """
+    Update subject fields.
+    If status is being changed → record status_updated_at timestamp.
+    This timestamp is used to detect stale status later.
+    """
     for key, value in data.items():
         if value is not None:
             setattr(subject, key, value)
+
+            # -------------------------------------------------------
+            # FIX: track when status was last manually set
+            # used in service layer to detect stale status
+            # e.g. user set "completed" → then added new topics
+            # -------------------------------------------------------
+            if key == "status":
+                subject.status_updated_at = datetime.now(timezone.utc)
+
     subject.updated_at = datetime.now(timezone.utc)
     await db.flush()
     await db.refresh(subject)
@@ -79,7 +89,7 @@ async def delete_subject(
     db: AsyncSession,
     subject: Subject,
 ) -> None:
-    """Delete a subject and all its topics (cascade)."""
+    """Delete subject — topics cascade via DB FK."""
     await db.delete(subject)
     await db.flush()
 
@@ -95,15 +105,15 @@ async def create_topic(
     topic_name: str,
 ) -> SubjectTopic:
     """
-    Create a new topic.
-    target_percentage is set AFTER creation via recalculate.
+    Create a single topic.
+    target_percentage starts at 0 — recalculate() called right after.
     """
     topic = SubjectTopic(
         id                = str(uuid.uuid4()),
         subject_id        = subject_id,
         user_id           = user_id,
         topic_name        = topic_name,
-        target_percentage = Decimal("0.00"),  # will be recalculated right after
+        target_percentage = Decimal("0.00"),
     )
     db.add(topic)
     await db.flush()
@@ -114,7 +124,7 @@ async def get_topics_by_subject(
     db: AsyncSession,
     subject_id: str,
 ) -> list[SubjectTopic]:
-    """Get all topics under a subject."""
+    """Get all topics under a subject ordered by creation time."""
     result = await db.execute(
         select(SubjectTopic)
         .where(SubjectTopic.subject_id == subject_id)
@@ -144,11 +154,16 @@ async def recalculate_topic_percentages(
 ) -> None:
     """
     Recalculate target_percentage for ALL topics under a subject.
-    Called after adding or deleting a topic.
+    Called after: topic added, topic deleted.
 
-    Formula: 100 / total_topics
-    e.g. 4 topics → 25.00% each
-         5 topics → 20.00% each
+    Formula: 100 / total_topics per topic
+    Last topic absorbs rounding remainder to ensure sum = exactly 100.
+
+    e.g. 3 topics:
+        topic 1 → 33.33
+        topic 2 → 33.33
+        topic 3 → 33.34  ← absorbs remainder
+        total   = 100.00 ✓
     """
     topics = await get_topics_by_subject(db, subject_id)
     total  = len(topics)
@@ -156,34 +171,34 @@ async def recalculate_topic_percentages(
     if total == 0:
         return
 
-    percentage = Decimal("100.00") / Decimal(str(total))
-    percentage = percentage.quantize(Decimal("0.01"))  # round to 2 decimal places
+    per_topic = (Decimal("100.00") / Decimal(total)).quantize(
+        Decimal("0.01"), rounding=ROUND_DOWN
+    )
 
-    for topic in topics:
-        topic.target_percentage = percentage
+    # sum of all but last
+    assigned_sum = per_topic * (total - 1)
+
+    # last topic gets the remainder
+    remainder = Decimal("100.00") - assigned_sum
+
+    for i, topic in enumerate(topics):
+        topic.target_percentage = remainder if i == total - 1 else per_topic
 
     await db.flush()
 
 
-async def mark_topic_complete(
+async def toggle_topic_completion(
     db: AsyncSession,
     topic: SubjectTopic,
+    is_completed: bool,
 ) -> SubjectTopic:
-    """Mark a topic as completed."""
-    topic.is_completed = True
-    topic.completed_at = datetime.now(timezone.utc)
-    await db.flush()
-    await db.refresh(topic)
-    return topic
-
-
-async def mark_topic_incomplete(
-    db: AsyncSession,
-    topic: SubjectTopic,
-) -> SubjectTopic:
-    """Unmark a topic as completed."""
-    topic.is_completed = False
-    topic.completed_at = None
+    """
+    Mark topic complete or incomplete.
+    Merged mark_topic_complete + mark_topic_incomplete into one fn.
+    Matches PATCH /topics/:id payload: { is_completed: bool }
+    """
+    topic.is_completed = is_completed
+    topic.completed_at = datetime.now(timezone.utc) if is_completed else None
     await db.flush()
     await db.refresh(topic)
     return topic
@@ -193,10 +208,11 @@ async def delete_topic(
     db: AsyncSession,
     topic: SubjectTopic,
 ) -> None:
-    """Delete a topic then recalculate percentages for remaining topics."""
+    """Delete topic → recalculate percentages for remaining topics."""
     subject_id = topic.subject_id
     await db.delete(topic)
     await db.flush()
+    # recalc after delete so remaining topics fill 100%
     await recalculate_topic_percentages(db, subject_id)
 
 
@@ -204,16 +220,15 @@ async def delete_topic(
 # COMPUTED FIELDS
 # -------------------------------------------------------
 
-async def get_subject_completion(
-    db: AsyncSession,
-    subject_id: str,
-) -> dict:
+def compute_subject_completion(topics: list[SubjectTopic]) -> dict:
     """
-    Compute completion stats for a subject.
-    Returns total_topics, completed_topics, completion_percentage.
-    """
-    topics = await get_topics_by_subject(db, subject_id)
+    Compute completion stats from already-loaded topics list.
+    Pure function — no DB call needed.
+    Called in service layer after topics are fetched.
 
+    Returns:
+        total_topics, completed_topics, completion_percentage, status_stale
+    """
     total_topics     = len(topics)
     completed_topics = sum(1 for t in topics if t.is_completed)
     completion_pct   = sum(
@@ -221,7 +236,7 @@ async def get_subject_completion(
     )
 
     return {
-        "total_topics":            total_topics,
-        "completed_topics":        completed_topics,
-        "completion_percentage":   completion_pct,
+        "total_topics":          total_topics,
+        "completed_topics":      completed_topics,
+        "completion_percentage": completion_pct,
     }
